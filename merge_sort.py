@@ -1,16 +1,18 @@
 import argparse
 from contextlib import ExitStack
 import os
+import time
 import uuid
 
 
 ALPHABET = list('abcdefghijklmnopqrstuvwxyz')
 LETTER_TO_POW = {x: 2 ** i for i, x in enumerate(ALPHABET)}
 POW_TO_LETTER = {2 ** i: x for i, x in enumerate(ALPHABET)}
+DELETE_TMP = True
 
 # M and B from Vitter model
-M = 100
-B = 4
+M = 100000000
+B = 16000000
 
 class BitSet(object):
     def __init__(self):
@@ -63,13 +65,10 @@ class TrieNode(object):
         else:
             min_letter = self.children_bit_set.get_min()
             min_child = self.children[min_letter]
-            if min_child.terminal_data:
-                res = min_child.terminal_data.pop()
-                if not min_child.terminal_data and not min_child.children:
-                    self.delete_child(min_letter)
-                return res
-            else:
-                return min_child.pop_min()
+            res = min_child.pop_min()
+            if not min_child.terminal_data and not min_child.children:
+                self.delete_child(min_letter)
+            return res
 
     def is_empty(self):
         return len(self.children) == 0 and len(self.terminal_data) == 0
@@ -93,16 +92,19 @@ class FileReader(object):
         chunk_size = end_fragment - start_fragment
         if chunk_size > 2 * self.read_bytes:
             raise MemoryError('string in file is bigger than read_bytes bytes')
+        self.file_handler.seek(start_fragment)
         chunk = self.file_handler.read(chunk_size).decode()
         # invert lines to have smaller strings on the top of the buffer
         self.buffer = chunk.splitlines()[::-1]
         self.file_exhausted = end_fragment >= self.end_file
 
     def pop(self):
-        res = self.buffer.pop()
         if not self.buffer:
             self.fill_buffer()
-        return res, self.file_exhausted and not self.buffer
+        if self.buffer:
+            return self.buffer.pop()
+        else:
+            return None
 
 
 class FileWriter(object):
@@ -113,12 +115,13 @@ class FileWriter(object):
         self.buffer = []
 
     def flush(self):
-        self.file_handler.write('\n'.join(self.buffer))
+        self.file_handler.write(''.join(self.buffer))
         self.buffer = []
         self.total_len = 0
 
     def write(self, word):
         self.buffer.append(word)
+        self.buffer.append('\n')
         self.total_len += len(word)
         if self.total_len > self.buffer_size:
             self.flush()
@@ -132,9 +135,12 @@ class FileManager(object):
     def get_new_file_name(self, is_tmp):
         for i in range(10):
             unique_filename = str(uuid.uuid4())
-            if unique_filename not in self.tmp_fnames and unique_filename not in self.other_file_names:
-                self.tmp_fnames[unique_filename] = is_tmp
-                return unique_filename
+            # unique_filename = '{}.txt'.format(len(self.tmp_file_names))
+            # if os.path.exists(unique_filename):
+            #     os.remove(unique_filename)
+            if unique_filename not in self.tmp_file_names and unique_filename not in self.other_file_names:
+                self.tmp_file_names[unique_filename] = is_tmp
+            return unique_filename
         else:
             raise Exception('can not find unique name')
 
@@ -145,31 +151,32 @@ class FileManager(object):
 
 
 def merge_sorted_files_in_one_file(fnames_list, file_manager):
-    output_fname = file_manager.get_new_file_name(is_tmp=False)
+    output_fname = file_manager.get_new_file_name(is_tmp=DELETE_TMP)
     with open(output_fname, 'a') as output_file:
         with ExitStack() as stack:
-            files = [stack.enter_context(open(fname)) for fname in fnames_list]
+            files = [stack.enter_context(open(fname, 'rb')) for fname in fnames_list]
             file_sizes = [os.path.getsize(fname) for fname in fnames_list]
             file_readers = [FileReader(file, B, file_size) for file, file_size in zip(files, file_sizes)]
-            trie = TrieNode()
+            trie = TrieNode([])
             writer = FileWriter(output_file, B)
-            for reader in file_readers:
-                # we read words from reader but not pop them
-                # because we pop the word at the moment when it is minimal in trie
-                # and we can write it to output file
-                for w in reader.buffer:
-                    trie.add_word(w, 0, reader)
             num_reading_ends = 0
+            for reader in file_readers:
+                word = reader.pop()
+                if word is not None:
+                    trie.add_word(word, 0, (reader, word))
+                else:
+                    num_reading_ends += 1
             while num_reading_ends < len(fnames_list):
-                reader = trie.pop_min()
-                word, reading_end = reader.pop()
-                # reading_end = True can be only once for a reader
-                if reading_end:
+                reader, word = trie.pop_min()
+                writer.write(word)
+                new_word = reader.pop()
+                if new_word is None:
                     num_reading_ends += 1
                 else:
-                    trie.add_word(reader.pop())
-                writer.write(word)
+                    trie.add_word(new_word, 0, (reader, new_word))
+                # reading_end = True can be only once for a reader
             writer.flush()
+    return output_fname
 
 
 def merge_sorted_files(fnames_list, file_manager):
@@ -187,11 +194,13 @@ def merge_sorted_files(fnames_list, file_manager):
 def merge_phase(fnames_list, file_manager):
     while len(fnames_list) > 1:
         fnames_list = merge_sorted_files(fnames_list, file_manager)
-    return fnames_list[0]
+    result_file_name = fnames_list[0]
+    file_manager.tmp_file_names[result_file_name] = False
+    return result_file_name
 
 
 def sort_file_in_memory(input_file, file_manager):
-    output_fname = file_manager.get_new_file_name(False)
+    output_fname = file_manager.get_new_file_name(DELETE_TMP)
     start_fragment = input_file.tell()
     input_file.seek(M, 1)
     input_file.readline()
@@ -199,14 +208,16 @@ def sort_file_in_memory(input_file, file_manager):
     chunk_size = end_fragment - start_fragment
     if chunk_size > M + B:
         raise MemoryError('string in file is bigger than B bytes')
+    input_file.seek(start_fragment)
     words = input_file.read(chunk_size).decode().splitlines()
-    trie = TrieNode()
+    trie = TrieNode([])
     for word in words:
         trie.add_word(word, 0, word)
     with open(output_fname, 'a') as output_file:
-        writer = FileWriter(output_fname, B)
+        writer = FileWriter(output_file, B)
         while not trie.is_empty():
-            writer.write(trie.pop_min())
+            w = trie.pop_min()
+            writer.write(w)
         writer.flush()
     return output_fname
 
@@ -223,6 +234,7 @@ def sort_file(fname):
     with open(fname, 'rb') as input_file:
         fnames_list = get_sorted_chunks(input_file, os.path.getsize(fname), file_manager)
     output_fname = merge_phase(fnames_list, file_manager)
+    file_manager.close()
     return output_fname
 
 
@@ -232,8 +244,11 @@ def main():
     parser.add_argument('--input', type=str, help='name of file to sort')
     args = parser.parse_args()
     input_file_name = args.input
+    start = time.time()
     output_filename = sort_file(input_file_name)
+    end = time.time()
     print('output_filename is %s' % output_filename)
+    print('time of work is %s seconds' % end - start)
 
 
 if __name__ == '__main__':
