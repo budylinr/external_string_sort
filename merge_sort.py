@@ -248,7 +248,7 @@ def main():
     output_filename = sort_file(input_file_name)
     end = time.time()
     print('output_filename is %s' % output_filename)
-    print('time of work is %s seconds' % end - start)
+    print('time of work is {} seconds'.format(end - start))
 
 
 if __name__ == '__main__':

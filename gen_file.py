@@ -34,8 +34,7 @@ def main():
     start = time.time()
     generate(output_filename, max_len, lines_count)
     end = time.time()
-    print('time of work is %s seconds' % end - start)
-
+    print('time of work is {} seconds'.format(end - start))
 
 
 if __name__ == '__main__':
